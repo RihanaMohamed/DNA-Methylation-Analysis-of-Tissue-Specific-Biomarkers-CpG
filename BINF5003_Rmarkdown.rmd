@@ -1,0 +1,482 @@
+---
+title: "Forensic Dataset"
+output: 
+  pdf_document: 
+    latex_engine: xelatex
+date: "2024-11-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy = FALSE, cache = FALSE, comment = NA)
+options(width = 80) # Adjust console width
+
+```
+
+## Introduction
+
+The data set chosen for this analysis is titled "Genome-wide profiling and validation for forensic tissue-specific DNA methylation markers" (GEO ID: GSE55737), and will be used to identify body fluid-specific DNA methylation markers to see which CpG sites are most informative in such investigations.
+
+## Data Wrangling
+
+```{r data wrangling, message=FALSE, warning=FALSE}
+# ========= Load Libraries =========
+library(Biobase)
+library(GEOquery)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(cowplot)
+library(Rtsne)
+library(umap)
+library(clusterProfiler)
+# library(EnhancedVolcano)
+library(pheatmap)
+library(limma)
+library(minfi)
+
+# ========= Load Dataset =========
+gset <- getGEO("GSE55734", GSEMatrix = TRUE, getGPL = TRUE)
+gset_forensic = gset[["GSE55734_series_matrix.txt.gz"]]
+
+# ========= Dataset Exploration =========
+
+# Assay Data
+assay_data = gset_forensic@assayData[["exprs"]] # Columns are sample IDs, rows are methylation sites 
+dim(assay_data) # 485,577 CpG sites and 16 samples
+head(assay_data) # Proportion of methylated CpG sites stored in assay_data
+
+# Phenotype Data
+pheno_data = pData(gset_forensic) # Columns are tissue and sample type, rows are sample IDs
+head(pheno_data) 
+dim(pheno_data)
+colnames(pheno_data)
+head(pheno_data$source_name_ch1) #ch1 contains sample tissue type
+sampletypes <- table(pheno_data$source_name_ch1) # 6 blood, 4 saliva, 6 vaginal secretion
+
+# Feature Data 
+feature_data = fData(gset_forensic) # Additional information about each sample
+head(feature_data)
+```
+
+## Data Cleaning
+
+```{r data cleaning, message=FALSE, warning=FALSE}
+# ========= Dataset Cleaning =========
+
+# 1. Check for NA values
+summary(assay_data) # Dataset contains NAs
+assay_data_NAs <- mutate(as.data.frame(assay_data), 
+NA_count = rowSums(is.na(assay_data)))
+
+assay_data_NAs_filtered <- assay_data_NAs %>% filter(NA_count != 0)
+
+# Change y axis labels to non-scientific notation
+marks_no_sci <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+# Barplot showing NA distribution
+na_distrib <- ggplot(assay_data_NAs_filtered, aes(x = NA_count)) + 
+  geom_bar(fill="blue") +
+  labs(title = "Distribution of NA Values", x = "NA Count", y = "Number of CpG Sites") +
+  scale_y_continuous(labels = marks_no_sci) +
+  scale_x_discrete(name ="NA Count", 
+  breaks = c("1","2","3","4","5","6","7","8","9","10") , 
+  limits = c("1","2","3","4","5","6","7","8","9","10")) +
+  geom_text(aes(label = after_stat(count)), stat = "count", 
+  vjust = -0.2, 
+  colour = "black")
+
+# Removing NA Data
+assay_data_NAremoved = na.omit(assay_data)
+dim(assay_data_NAremoved) # 9543 incomplete records removed
+
+# 2. Checking for duplicates
+
+# Check for duplicates in rows
+#nrow(assay_data_NAremoved)  == count(unique(as.data.frame(assay_data_NAremoved))) # returns TRUE
+unique_rows <- as.data.frame(unique(as.data.frame(assay_data_NAremoved)))
+nrow(assay_data_NAremoved) == nrow(unique_rows)
+
+# Check for duplicates in columns
+colnames(assay_data_NAremoved) == (unique(colnames(as.data.frame(assay_data_NAremoved)))) # returns TRUE
+
+# 3. Checking standard deviation
+# Check distribution of standard deviation at each site
+row_stdev <- apply(assay_data_NAremoved, 1, sd)
+assay_data_sd <- mutate(as.data.frame(assay_data_NAremoved), 
+std_dev = apply(as.data.frame(assay_data_NAremoved), 1, sd))
+
+# Barplot showing standard deviation distribution
+ggplot(assay_data_sd, aes(x = std_dev)) + 
+  geom_histogram(fill="blue") +
+  labs(title = "Distribution of Standard Deviation", 
+  x = "Standard Deviation", 
+  y = "Number of CpG Sites") +
+  scale_y_continuous(labels = marks_no_sci)
+
+# Top 25% most variable sites
+top25_sd = assay_data_sd %>% filter(std_dev > quantile(std_dev, 0.75))
+dim(top25_sd) # 119,009 records
+
+# Top 10% most variable sites
+top10_sd = assay_data_sd %>% filter(std_dev > quantile(std_dev, 0.90))
+dim(top10_sd) # 47,604 records
+
+# Top 5% most variable sites
+top5_sd = assay_data_sd %>% filter(std_dev > quantile(std_dev, 0.95))
+dim(top5_sd) # 23,802 records
+
+# Top 1% most variable sites
+top1_sd = assay_data_sd %>% filter(std_dev > quantile(std_dev, 0.99))
+dim(top1_sd)
+
+assay_data_cleaned_1 = top1_sd[,-17]
+
+assay_data_cleaned = top5_sd[,-17] # Removes standard deviation column
+
+assay_data_cleaned_10 = top10_sd[,-17]
+
+assay_data_cleaned_25 = top25_sd[,-17]
+```
+
+## Dimensionality Reduction (PCA, t-SNE, UMAP)
+
+```{r dimred, message=FALSE, warning=FALSE}
+
+# PCA
+pca <- prcomp(t(assay_data_cleaned)) # omits values of NA
+pcaPlot<-data.frame(pca$x) 
+names(pca)
+head(pca$x)[,1:5]
+ggplot(data = data.frame(pca$x),aes(x = PC1, y = PC2, col = pheno_data$source_name_ch1)) +
+  geom_point() +
+  labs(title = "PCA Top 5%") # colour the points by a feature to see what separates the clusters
+
+
+# tSNE
+set.seed(46)
+num_samples <- ncol(assay_data_cleaned)
+perplexity_val <- min(5, (num_samples- 1) / 3)
+
+
+# Perform t-SNE
+tsne_results <- Rtsne(
+  t(assay_data_cleaned), dims = 2, perplexity = perplexity_val,       
+  verbose = TRUE, max_iter = 500        
+)
+
+tsne_df <- data.frame(
+  Dim1 = tsne_results$Y[, 1],
+  Dim2 = tsne_results$Y[, 2],
+  Tissue = pheno_data$source_name_ch1
+)
+
+tsne_plot <- ggplot(tsne_df, aes(x = Dim1, y = Dim2, color = Tissue)) +
+  geom_point() +
+  labs(title = "t-SNE of Methylation Data", x = "Dim1", y = "Dim2") +
+  scale_color_discrete(name = "Tissue Type")
+
+#UMAP
+umap_results <- umap(t(assay_data_cleaned))
+umap_df <- data.frame(Dim1 = umap_results$layout[, 1], Dim2 = umap_results$layout[, 2], Tissue = pheno_data$source_name_ch1)
+
+umap_plot <- ggplot(umap_df, aes(x = Dim1, y = Dim2, color = Tissue)) +
+  geom_point() +
+  labs(title = "UMAP of Methylation Data", x = "Dim1", y = "Dim2") +
+  scale_color_discrete(name = "Tissue Type")
+
+tsne_plot|umap_plot
+```
+
+## Differential Analyses
+
+```{r diff, message=FALSE, warning=FALSE}
+# MA and MDS plots
+densityPlot(as.matrix(assay_data_cleaned), main = "Density of Beta Values")
+
+normalized_data <- normalizeBetweenArrays(assay_data_cleaned, method = "quantile")
+
+densityPlot(as.matrix(assay_data_cleaned), main = "Before Normalization")
+densityPlot(as.matrix(normalized_data), main = "After Normalization")
+
+limma::plotMA(assay_data_cleaned, ylim = c(-1, 1), main = "Before Normalization")
+limma::plotMA(normalized_data, ylim = c(-1, 1), main = "After Normalization") 
+```
+
+### **MDS Plot Generation**
+
+```{r mds}
+Tissue = pheno_data$source_name_ch1
+color_pal <- as.factor(pheno_data$source_name_ch1)
+palette_colors <- scales::hue_pal()(length(unique(color_pal)))
+tissue_col_map <- setNames(palette_colors, levels(color_pal))
+
+plotMDS(assay_data_cleaned, 
+        col = tissue_col_map[color_pal],  # Assign colors by tissue type
+        main = "MDS Plot Before Normalization")
+legend("bottomright", 
+       legend = levels(color_pal), 
+       fill = palette_colors, 
+       title = "Tissue Type")
+
+plotMDS(normalized_data, 
+        col = tissue_col_map[color_pal],  # Assign colors by tissue type
+        main = "MDS Plot After Normalization")
+legend("bottomleft", 
+       legend = levels(color_pal), 
+       fill = palette_colors, 
+       title = "Tissue Type")
+```
+
+### **Post-Model Fit MA Plot**
+
+```{r matrix maplot}
+foren_design <- model.matrix(~ 0 + pheno_data$source_name_ch1)
+colnames(foren_design) <- gsub("pheno_data\\$source_name_ch1", "", colnames(foren_design))
+colnames(foren_design) <- make.names(colnames(foren_design))
+
+beta_to_m <- function(beta) log2(beta / (1 - beta))
+m_values <- beta_to_m(normalized_data)
+
+fit <- lmFit(m_values, foren_design)
+
+contrast_matrix <- makeContrasts(
+  Blood_vs_Saliva = Blood - Saliva,
+  Blood_vs_Vaginal = Blood - Vaginal.secretion,
+  Saliva_vs_Vaginal = Saliva - Vaginal.secretion,
+  levels = foren_design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+limma::plotMA(fit2, main = "MA Plot with Tissue Types")
+```
+
+### **Volcano Plot Data Preparation**
+
+```{r volcano}
+# Volcano plots and contrasts
+
+# Blood vs Saliva
+top_blood_vs_saliva <- topTable(fit2, coef = "Blood_vs_Saliva", adjust.method = "BH", number = Inf)
+significant_blood_vs_saliva <- top_blood_vs_saliva[
+  top_blood_vs_saliva$adj.P.Val < 0.05 & abs(top_blood_vs_saliva$logFC) > 1, ]
+
+# Blood vs Vaginal
+top_blood_vs_vaginal <- topTable(fit2, coef = "Blood_vs_Vaginal", adjust.method = "BH", number = Inf)
+significant_blood_vs_vaginal <- top_blood_vs_vaginal[
+  top_blood_vs_vaginal$adj.P.Val < 0.05 & abs(top_blood_vs_vaginal$logFC) > 1, ]
+
+# Saliva vs Vaginal
+top_saliva_vs_vaginal <- topTable(fit2, coef = "Saliva_vs_Vaginal", adjust.method = "BH", number = Inf)
+significant_saliva_vs_vaginal <- top_saliva_vs_vaginal[
+  top_saliva_vs_vaginal$adj.P.Val < 0.05 & abs(top_saliva_vs_vaginal$logFC) > 1, ]
+
+# Combine Results for All Contrasts - add column for 1 of 3 contrast types
+significant_blood_vs_saliva$Contrast <- "Blood_vs_Saliva"
+significant_blood_vs_vaginal$Contrast <- "Blood_vs_Vaginal"
+significant_saliva_vs_vaginal$Contrast <- "Saliva_vs_Vaginal"
+
+all_significant <- rbind(
+  significant_blood_vs_saliva,
+  significant_blood_vs_vaginal,
+  significant_saliva_vs_vaginal
+)
+
+# View combined results
+head(all_significant)
+
+# Save Results to CSV
+write.csv(all_significant, "significant_features_all_contrasts.csv", row.names = TRUE)
+
+# Add significance labels for all contrasts with Hypermethylated, Hypomethylated, and Not Significant
+top_blood_vs_saliva$Significant <- with(
+  top_blood_vs_saliva,
+  ifelse(adj.P.Val < 0.05 & logFC > 1, "Hypermethylated",
+         ifelse(adj.P.Val < 0.05 & logFC < -1, "Hypomethylated", "Not Significant"))
+)
+
+top_blood_vs_vaginal$Significant <- with(
+  top_blood_vs_vaginal,
+  ifelse(adj.P.Val < 0.05 & logFC > 1, "Hypermethylated",
+         ifelse(adj.P.Val < 0.05 & logFC < -1, "Hypomethylated", "Not Significant"))
+)
+
+top_saliva_vs_vaginal$Significant <- with(
+  top_saliva_vs_vaginal,
+  ifelse(adj.P.Val < 0.05 & logFC > 1, "Hypermethylated",
+         ifelse(adj.P.Val < 0.05 & logFC < -1, "Hypomethylated", "Not Significant"))
+)
+
+# Add Contrast column to identify comparisons
+top_blood_vs_saliva$Contrast <- "Blood_vs_Saliva"
+top_blood_vs_vaginal$Contrast <- "Blood_vs_Vaginal"
+top_saliva_vs_vaginal$Contrast <- "Saliva_vs_Vaginal"
+
+# Combine all contrasts into a list for plotting
+contrast_list <- list(
+  "Blood_vs_Saliva" = top_blood_vs_saliva,
+  "Blood_vs_Vaginal" = top_blood_vs_vaginal,
+  "Saliva_vs_Vaginal" = top_saliva_vs_vaginal
+)
+```
+
+### **Volcano Plot Generation**
+
+```{r volcano plot generation}
+# Loop over contrasts and generate volcano plots
+for (contrast_name in names(contrast_list)) {
+  contrast_data <- contrast_list[[contrast_name]]
+  
+  # Create volcano plot
+  plot <- ggplot(contrast_data, aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c(
+      "Not Significant" = "grey",
+      "Hypermethylated" = "brown4",
+      "Hypomethylated" = "cyan3"
+    )) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+    labs(
+      title = paste("Volcano Plot:", contrast_name),
+      x = "Log Fold Change (logFC)",
+      y = "-log10 Adjusted P-Value",
+      color = "Methylation Status"
+    ) +
+    theme_minimal()
+  
+  print(plot)  # Display the plot
+}
+```
+
+### **Heatmap Data Preparation**
+
+```{r heatmap data prep}
+# Heatmap
+# Blood-specific CpG sites
+blood_specific <- significant_blood_vs_saliva[
+  rownames(significant_blood_vs_saliva) %in% rownames(significant_blood_vs_vaginal) &
+    !rownames(significant_blood_vs_saliva) %in% rownames(significant_saliva_vs_vaginal), ]
+
+# Saliva-specific CpG sites
+saliva_specific <- significant_blood_vs_saliva[
+  rownames(significant_blood_vs_saliva) %in% rownames(significant_saliva_vs_vaginal) &
+    !rownames(significant_blood_vs_saliva) %in% rownames(significant_blood_vs_vaginal), ]
+
+# Vaginal-specific CpG sites
+vaginal_specific <- significant_blood_vs_vaginal[
+  rownames(significant_blood_vs_vaginal) %in% rownames(significant_saliva_vs_vaginal) &
+    !rownames(significant_blood_vs_vaginal) %in% rownames(significant_blood_vs_saliva), ]
+
+# Combine tissue-specific CpG sites
+tissue_specific_cpgs <- unique(c(rownames(blood_specific), rownames(saliva_specific), rownames(vaginal_specific)))
+ 
+
+# Create a simplified annotation dataframe
+annotated_col <- pheno_data[, c("source_name_ch1"), drop = FALSE]
+
+# Ranked gene list
+top_blood_vs_saliva$Rank <- -log10(top_blood_vs_saliva$P.Value) * sign(top_blood_vs_saliva$logFC)
+top_blood_vs_vaginal$Rank <- -log10(top_blood_vs_vaginal$P.Value) * sign(top_blood_vs_vaginal$logFC)
+top_saliva_vs_vaginal$Rank <- -log10(top_saliva_vs_vaginal$P.Value) * sign(top_saliva_vs_vaginal$logFC)
+
+# Sort by Rank
+ranked_blood_vs_saliva <- top_blood_vs_saliva[order(-top_blood_vs_saliva$Rank), ]
+ranked_blood_vs_vaginal <- top_blood_vs_vaginal[order(-top_blood_vs_vaginal$Rank), ]
+ranked_saliva_vs_vaginal <- top_saliva_vs_vaginal[order(-top_saliva_vs_vaginal$Rank), ]
+
+# Normalize ranks for each contrast
+top_blood_vs_saliva$NormalizedRank <- rank(-top_blood_vs_saliva$Rank)
+top_blood_vs_vaginal$NormalizedRank <- rank(-top_blood_vs_vaginal$Rank)
+top_saliva_vs_vaginal$NormalizedRank <- rank(-top_saliva_vs_vaginal$Rank)
+
+# Add a Contrast column for identification
+top_blood_vs_saliva$Contrast <- "Blood_vs_Saliva"
+top_blood_vs_vaginal$Contrast <- "Blood_vs_Vaginal"
+top_saliva_vs_vaginal$Contrast <- "Saliva_vs_Vaginal"
+
+# Create a simplified annotation dataframe
+annotated_col <- pheno_data[, c("source_name_ch1"), drop = FALSE]
+
+# Subset normalized data for significant CpG sites
+heatmap_data <- normalized_data[tissue_specific_cpgs, ]
+colnames(heatmap_data) <- pheno_data$title
+rownames(annotated_col) <- colnames(heatmap_data)
+```
+
+### **Heatmap Generation**
+
+```{r heatmap generation}
+# Generate heatmap
+cpg_heatmap <- pheatmap(
+  heatmap_data, 
+  annotation_col = annotated_col,  # Add tissue type metadata
+  cluster_rows = TRUE, 
+  cluster_cols = TRUE,
+  main = "Heatmap of Tissue-Specific CpG Sites",
+)
+```
+
+### **Filtering for Tissue Specific Sites**
+
+```{r tissue filtering}
+# ======= Filtering for Tissue Specific Sites =======
+# trying with k=3 because there are 3 visible clusters in the heatmap
+cpg_clusters <- cbind(heatmap_data, cluster = cutree(cpg_heatmap$tree_row, k = 3))
+cpg_df <- as.data.frame(cpg_clusters)
+cpg_df_c1 <- cpg_df[cpg_df$cluster == 1, ] # hypomethylated in vaginal secretions + saliva
+cpg_df_c2 <- cpg_df[cpg_df$cluster == 2, ] # hypomethylated in blood + saliva, undetermined in vaginal secretions (some samples show hypermethylation, some show no change)
+cpg_df_c3 <- cpg_df[cpg_df$cluster == 3, ] # hypermethylated in blood + saliva
+
+blood_specific_pval <- blood_specific[blood_specific$adj.P.Val < 0.05, ] 
+blood_specific_ordered <- blood_specific_pval[order(blood_specific_pval$adj.P.Val),]
+blood_most_sig <- blood_specific_ordered[1:10, ] %>% 
+  mutate(Tissue = "Blood")
+
+blood_specific_FC <- mutate(blood_specific, abs(blood_specific$logFC))
+blood_specific_ordered_FC <- blood_specific_FC[order(blood_specific_pval$logFC, decreasing= TRUE),]
+
+
+saliva_specific_pval <- saliva_specific[saliva_specific$adj.P.Val < 0.05, ]
+saliva_specific_ordered <- saliva_specific_pval[order(saliva_specific_pval$adj.P.Val),]
+saliva_most_sig <- saliva_specific_ordered[1:10, ] %>%
+  mutate(Tissue = "Saliva")
+
+saliva_specific_FC <- mutate(saliva_specific, abs(saliva_specific$logFC))
+saliva_specific_ordered_FC <- saliva_specific_FC[order(saliva_specific_pval$logFC, decreasing= TRUE),]
+
+
+vaginal_specific_pval <- vaginal_specific[vaginal_specific$adj.P.Val < 0.05, ]
+vaginal_specific_ordered <- vaginal_specific_pval[order(vaginal_specific_pval$adj.P.Val),]
+vaginal_most_sig <- vaginal_specific_ordered[1:10, ] %>% 
+  mutate(Tissue = "Vaginal")
+
+vaginal_specific_FC <- mutate(vaginal_specific, abs(vaginal_specific$logFC))
+vaginal_specific_ordered_FC <- vaginal_specific_FC[order(vaginal_specific_pval$logFC,decreasing= TRUE),]
+
+most_sig_sites <- rbind(vaginal_most_sig, blood_most_sig, saliva_most_sig) # Combined results with 10 CpG sites per tissue 
+
+
+# ANSWER to RESEARCH QUESTION: "Which CpG sites are associated with the DNA derived from different body fluid-specific samples?”
+cpg_tissue_isolated <- most_sig_sites[8] # isolates the cpg site and the associated tissue
+
+print(cpg_tissue_isolated)
+
+## Further exploration of identified CpG Sites
+most_sig_sites <- most_sig_sites %>%
+  rownames_to_column(var="CpGSites")
+
+sigsitefeaturedata <- merge(x = most_sig_sites, y = feature_data, by.x="CpGSites", by.y = "ID", all.x=TRUE)
+
+sigsitefeaturedata_filtered <- subset(sigsitefeaturedata, select = c("CpGSites","Tissue", "AlleleA_ProbeSeq", "AlleleB_ProbeSeq", "Infinium_Design_Type", "UCSC_RefGene_Name","UCSC_RefGene_Group","UCSC_CpG_Islands_Name","Relation_to_UCSC_CpG_Island","Regulatory_Feature_Name" , "Regulatory_Feature_Group"))
+
+genetable <- data.frame(
+  "CpG Site" = sigsitefeaturedata_filtered$CpGSites,
+  "Associated Tissue" = sigsitefeaturedata_filtered$Tissue,
+  "Associated Gene"= sigsitefeaturedata_filtered$UCSC_RefGene_Name)
+
+write.csv(genetable, "genetable.csv", row.names = FALSE)
+```
